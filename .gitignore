@@ -1,0 +1,19 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Streamlit local settings
+.streamlit/credentials.toml
+
+# macOS
+.DS_Store
+
+# Temporary outputs & data downloads
+*.zip
+
