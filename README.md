@@ -1,8 +1,8 @@
-# 📈 Historical Equity & Spot OHLC Data Downloader
+# 📈 Historical Equity & Spot OHLC Data Downloader & MA Screener
 
-A modern web application built with **Streamlit** and **yfinance** that allows users to fetch, inspect, visualize, and download historical Open, High, Low, Close (OHLC), and Volume data for equities, spot market indices, ETFs, and cryptocurrencies.
+A modern web application built with **Streamlit** and **yfinance** that allows users to fetch, inspect, visualize, screen, and download historical Open, High, Low, Close (OHLC), and Volume data for equities, spot market indices, ETFs, and cryptocurrencies.
 
-Supports both **Single Ticker Analysis** and **Batch CSV Upload (with one-click ZIP download)**.
+Supports both **Single Ticker Analysis** and **Bulk Upload with Moving Average Screener & ZIP Downloads**.
 
 ---
 
@@ -19,14 +19,25 @@ Supports both **Single Ticker Analysis** and **Batch CSV Upload (with one-click 
 - **Interactive Plotly Visualizations**: Candlestick chart with volume bars and line chart toggle.
 - **Single-Click CSV Download**: Formatted single-level CSV `{TICKER}_OHLC_{start}_{end}.csv`.
 
-### 2. 📦 Batch CSV Upload Mode (Zipped Output)
-- **Upload CSV with `Symbol` Column**: Upload any CSV containing stock scrips (e.g. `RELIANCE`, `TCS`, `INFY`).
+### 2. 📦 Bulk Upload & Moving Average Screener
+- **Upload CSV with `Symbol` Column**: Upload any CSV containing stock scrips (e.g. `RELIANCE`, `TCS`, `INFY` without `.NS`).
 - **Automatic Exchange Suffix**: Automatically appends `.NS` (National Stock Exchange of India) or custom suffix.
-- **Skip Duplicate Suffix**: Skips appending if the symbol already has an exchange suffix (`.NS`, `.BO`) or starts with `^`.
-- **Live Progress Tracking**: Real-time progress bar showing the active stock being fetched.
-- **One-Click ZIP Download**: Generates an in-memory `.zip` archive containing:
-  - Individual CSV files for each stock (`{SYMBOL}_OHLC_{start}_{end}.csv`).
-  - `_BATCH_DOWNLOAD_SUMMARY.csv`: A complete manifest of all symbols, status, trading days, and latest close.
+- **Custom Moving Average Screener**:
+  - **MA Type**: Simple Moving Average (`SMA`) or Exponential Moving Average (`EMA`).
+  - **MA Period**: User-configurable window (e.g. 20, 50, 100, 200 days).
+  - **Condition Operators**: Greater than (`>`), Less than (`<`), or Equal to / Near (`≈ / ==` with configurable tolerance band).
+  - **Comparison Modes**:
+    - `Close Price vs Moving Average` (e.g. Latest Close > 50 SMA).
+    - `Moving Average vs Target Value` (e.g. 50 SMA > 500.00).
+- **Server-Side Data Persistence & Fast Testing**:
+  - Downloaded CSVs are stored directly on the server disk (`./saved_data/`).
+  - Instant testing mode: screen server-cached data in seconds without re-fetching from Yahoo Finance.
+  - Sidebar cache counter and cache clearing button.
+- **Interactive Visual Inspector**: Inspect Candlestick charts with the Moving Average overlay for any filtered stock.
+- **Multi-Format Exports**:
+  - Download filtered stocks list (CSV).
+  - Download matching stocks historical OHLC data (.ZIP).
+  - Download all processed stocks master archive (.ZIP).
 
 ---
 

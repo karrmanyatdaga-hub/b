@@ -16,4 +16,10 @@ __pycache__/
 
 # Temporary outputs & data downloads
 *.zip
+saved_data/
+
+# Local scratches & agent files
+.agents/
+TEST.PY
+YAHOO FIN.TXT
 

@@ -6,8 +6,13 @@ import warnings
 import inspect
 import zipfile
 import io
+import os
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+# Server data storage directory for testing and screener cache
+SAVED_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_data")
+os.makedirs(SAVED_DATA_DIR, exist_ok=True)
 
 # Suppress minor deprecation warnings from internal dependencies
 warnings.filterwarnings("ignore")
@@ -122,6 +127,18 @@ st.markdown("""
         padding: 0.25rem 0.6rem;
         border-radius: 6px;
         border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    
+    /* Screener rule banner */
+    .rule-banner {
+        background: rgba(30, 41, 59, 0.7);
+        border: 1px solid rgba(56, 189, 248, 0.35);
+        border-radius: 8px;
+        padding: 0.75rem 1.1rem;
+        margin: 0.85rem 0 0.5rem 0;
+        color: #38BDF8;
+        font-weight: 600;
+        font-size: 0.95rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -279,6 +296,64 @@ def fetch_stock_ohlc(ticker: str, start_date: datetime.date, end_date: datetime.
     return final_df
 
 
+def compute_moving_average(df: pd.DataFrame, period: int, ma_type: str = "SMA") -> pd.Series:
+    """
+    Computes Simple Moving Average (SMA) or Exponential Moving Average (EMA)
+    on the 'Close' column of the given dataframe.
+    """
+    if df is None or "Close" not in df.columns or len(df) == 0:
+        return pd.Series(dtype=float)
+    
+    if str(ma_type).upper() == "EMA":
+        return df["Close"].ewm(span=period, adjust=False).mean()
+    else:
+        return df["Close"].rolling(window=period).mean()
+
+
+def evaluate_screener_condition(
+    latest_close: float,
+    latest_ma: float,
+    comparison_mode: str,
+    operator: str,
+    target_value: float = 0.0,
+    tolerance_pct: float = 1.0
+):
+    """
+    Evaluates whether the stock satisfies the Moving Average condition.
+    Returns: (is_match: bool, diff_pct: float, diff_pts: float, status_msg: str)
+    """
+    if pd.isna(latest_ma) or pd.isna(latest_close):
+        return False, 0.0, 0.0, "Insufficient Data"
+    
+    if "Target Value" in comparison_mode or "Value" in comparison_mode:
+        # Compare latest_ma against user input target_value
+        diff_pts = latest_ma - target_value
+        diff_pct = (diff_pts / target_value * 100.0) if target_value != 0 else 0.0
+        
+        if ">" in operator:
+            match = latest_ma > target_value
+        elif "<" in operator:
+            match = latest_ma < target_value
+        else:  # "==" or "≈"
+            tol_val = abs(target_value * (tolerance_pct / 100.0))
+            match = abs(diff_pts) <= tol_val
+    else:
+        # Compare latest_close against latest_ma
+        diff_pts = latest_close - latest_ma
+        diff_pct = (diff_pts / latest_ma * 100.0) if latest_ma != 0 else 0.0
+        
+        if ">" in operator:
+            match = latest_close > latest_ma
+        elif "<" in operator:
+            match = latest_close < latest_ma
+        else:  # "==" or "≈"
+            tol_val = abs(latest_ma * (tolerance_pct / 100.0))
+            match = abs(diff_pts) <= tol_val
+            
+    status_msg = "Passed" if match else "Failed"
+    return match, diff_pct, diff_pts, status_msg
+
+
 # ---------------------------------------------------------
 # Sidebar Inputs
 # ---------------------------------------------------------
@@ -286,9 +361,9 @@ with st.sidebar:
     st.markdown("### 🔀 Workflow Mode")
     app_mode = st.radio(
         "Choose Mode:",
-        ["🎯 Single Ticker", "📦 Batch CSV Upload (ZIP)"],
+        ["🎯 Single Ticker", "📦 Batch Upload & MA Screener"],
         index=0,
-        help="Single Ticker: Interactive chart & individual CSV.\nBatch Upload: Upload CSV with 'Symbol' column & download a ZIP of all CSVs."
+        help="Single Ticker: Interactive chart & individual CSV.\nBatch Upload & MA Screener: Upload CSV with 'Symbol' column, screen by Moving Average, and download ZIP/CSVs."
     )
     st.markdown("---")
 
@@ -375,6 +450,26 @@ with st.sidebar:
             value=True,
             help="Prevents duplicate suffixes like RELIANCE.NS.NS"
         )
+        st.markdown("---")
+        
+        # Server Storage Cache Info
+        saved_files_count = len([f for f in os.listdir(SAVED_DATA_DIR) if f.endswith(".csv")]) if os.path.exists(SAVED_DATA_DIR) else 0
+        st.subheader("💾 Server Storage")
+        st.caption(f"📁 **{saved_files_count}** stock CSVs stored on server.")
+        if saved_files_count > 0:
+            if st.button("🗑️ Clear Server Cache", help="Deletes saved CSV files on the server"):
+                for f in os.listdir(SAVED_DATA_DIR):
+                    if f.endswith(".csv"):
+                        try:
+                            os.remove(os.path.join(SAVED_DATA_DIR, f))
+                        except Exception:
+                            pass
+                st.session_state.pop("batch_zip_data", None)
+                st.session_state.pop("batch_manifest", None)
+                st.session_state.pop("screener_matched", None)
+                st.session_state.pop("screener_all", None)
+                st.session_state.pop("screener_meta", None)
+                st.rerun()
         st.markdown("---")
         
     # Date Range Pre-sets (Common to both modes)
@@ -655,11 +750,13 @@ if app_mode == "🎯 Single Ticker":
 
 else:
     # ---------------------------------------------------------
-    # Batch CSV Upload Mode
+    # Batch CSV Upload & Moving Average Screener Mode
     # ---------------------------------------------------------
-    st.markdown('<div class="main-title">📦 Batch Equity OHLC Downloader</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title">📦 Bulk Upload & Moving Average Screener</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="sub-title">Upload a CSV file containing a <b>Symbol</b> column. The app will automatically append <b>{batch_suffix if batch_suffix else "(none)"}</b>, fetch historical OHLC data for all scrips, and package individual CSVs into a single <b>.zip</b> file.</div>',
+        f'<div class="sub-title">Upload a CSV of stock symbols (without <code>.NS</code>), configure your custom Moving Average rules '
+        f'(SMA/EMA, &gt;, &lt;, or &#8776; user input value), filter stocks automatically, download all CSVs in a ZIP, '
+        f'and save data directly on the server for rapid screener testing.</div>',
         unsafe_allow_html=True
     )
 
@@ -667,14 +764,130 @@ else:
         st.error(f"❌ **Invalid Date Range**: Start date ({start_date}) cannot be after End date ({end_date}).")
         st.stop()
 
-    # Step 1: Instructions & Sample Template Card
+    # Step 1: Moving Average Screener Configuration Form
+    with st.container(border=True):
+        st.markdown("### 🎯 Moving Average Screener Setup")
+        st.caption("Define the Moving Average condition below. Stocks meeting your condition will be filtered and listed.")
+        
+        cfg_col1, cfg_col2, cfg_col3 = st.columns(3)
+        with cfg_col1:
+            ma_type = st.selectbox(
+                "Moving Average Type",
+                ["SMA (Simple Moving Average)", "EMA (Exponential Moving Average)"],
+                index=0,
+                help="SMA treats all days equally. EMA assigns higher weight to recent prices."
+            )
+            ma_type_short = "SMA" if "SMA" in ma_type else "EMA"
+
+        with cfg_col2:
+            ma_period = st.number_input(
+                "MA Period (Days / Candles)",
+                min_value=2,
+                max_value=500,
+                value=50,
+                step=5,
+                help="Period length for the moving average (e.g. 20, 50, 100, 200)."
+            )
+
+        with cfg_col3:
+            comparison_mode = st.selectbox(
+                "Comparison Mode",
+                [
+                    "Close Price vs Moving Average",
+                    "Moving Average vs Target Value"
+                ],
+                index=0,
+                help="Choose whether to compare the Stock's Latest Close against its MA, or compare the MA value against a specific numerical benchmark."
+            )
+
+        cond_col1, cond_col2 = st.columns(2)
+        with cond_col1:
+            operator_choice = st.selectbox(
+                "Condition Operator",
+                [
+                    "Greater than (>)",
+                    "Less than (<)",
+                    "Equal to / Near (≈ / ==)"
+                ],
+                index=0,
+                help="Condition to test against the target."
+            )
+
+        with cond_col2:
+            if comparison_mode == "Moving Average vs Target Value":
+                target_ma_val = st.number_input(
+                    f"Target Value for {ma_type_short}({ma_period})",
+                    min_value=0.0,
+                    value=500.0,
+                    step=25.0,
+                    format="%.2f",
+                    help=f"The benchmark value to compare {ma_type_short}({ma_period}) with."
+                )
+            else:
+                target_ma_val = 0.0
+                st.markdown(
+                    f"<div style='margin-top: 1.8rem; font-size: 0.9rem; color: #94A3B8;'>"
+                    f"Testing: <b>Latest Close Price</b> against <b>{ma_type_short}({ma_period})</b>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+        if "Equal to" in operator_choice or "≈" in operator_choice:
+            tol_col1, tol_col2 = st.columns([2, 1])
+            with tol_col1:
+                tolerance_pct = st.slider(
+                    "Equality Tolerance Band (± %)",
+                    min_value=0.0,
+                    max_value=10.0,
+                    value=1.5,
+                    step=0.1,
+                    format="±%.1f%%",
+                    help="Matches if value is within ±X% of target (0% = exact equality)."
+                )
+            with tol_col2:
+                st.caption(f"Matches if within **±{tolerance_pct}%** of target value.")
+        else:
+            tolerance_pct = 1.0
+
+        # Formulate active rule text
+        op_sym = ">" if ">" in operator_choice else ("<" if "<" in operator_choice else "≈")
+        tol_str = f" (±{tolerance_pct}%)" if op_sym == "≈" else ""
+        if comparison_mode == "Moving Average vs Target Value":
+            rule_text = f"Filter stocks where {ma_type_short}({ma_period}) {op_sym} {target_ma_val:,.2f}{tol_str}"
+        else:
+            rule_text = f"Filter stocks where Latest Close {op_sym} {ma_type_short}({ma_period}){tol_str}"
+
+        st.markdown(f'<div class="rule-banner">⚡ <b>Active Screener Rule:</b> {rule_text}</div>', unsafe_allow_html=True)
+
+    # Step 2: Server-Side Testing Cache Panel
+    server_saved_csvs = [f for f in os.listdir(SAVED_DATA_DIR) if f.endswith(".csv")] if os.path.exists(SAVED_DATA_DIR) else []
+    server_cached_count = len(server_saved_csvs)
+
+    test_server_btn = False
+    if server_cached_count > 0:
+        with st.container(border=True):
+            st.markdown(f"#### 🧪 Server Storage Cache & Fast Screener Testing ({server_cached_count} Stocks)")
+            st.markdown(
+                f"Historical data for **{server_cached_count} stocks** is already saved on the server disk in `saved_data/`. "
+                f"You can test your Moving Average rules on these cached files instantly without re-downloading from Yahoo Finance!"
+            )
+            test_server_btn = st.button(
+                f"⚡ Run Screener on Server Cached Stocks ({server_cached_count} Scrips)",
+                type="secondary",
+                **STRETCH
+            )
+
+    # Step 3: Instructions & CSV Upload
     with st.expander("ℹ️ Instructions & Download Sample Template", expanded=False):
         st.markdown(f"""
-        **How it works:**
+        **How Bulk Screener Works:**
         1. Upload a CSV file containing a column named **`Symbol`** (or `Ticker` / `Scrip`).
-        2. Scrip symbols in your CSV do **not** need `.NS` at the end (e.g. `RELIANCE`, `TCS`, `INFY`, `HDFCBANK`).
+        2. Stock symbols do **not** need `.NS` at the end (e.g. `RELIANCE`, `TCS`, `INFY`, `HDFCBANK`).
         3. The app automatically appends **`{batch_suffix}`** to each symbol before querying Yahoo Finance.
-        4. When the download finishes, download a single **`.zip`** archive containing all individual CSVs plus a summary manifest!
+        4. When processed:
+           - All downloaded CSVs are **saved directly on the server disk (`./saved_data/`)** for screener testing.
+           - Stocks satisfying the **Moving Average Rule** are filtered and displayed in an interactive table.
+           - Download the filtered stocks list as a CSV, matching stocks as a ZIP, or all stock CSVs in a single master ZIP.
         """)
         sample_csv = "Symbol\nRELIANCE\nTCS\nINFY\nHDFCBANK\nICICIBANK\nTATAMOTORS\nSBIN\n"
         st.download_button(
@@ -684,12 +897,14 @@ else:
             mime="text/csv"
         )
 
-    # Step 2: File Uploader
     uploaded_file = st.file_uploader(
         "Upload CSV file containing stock symbols:",
         type=["csv"],
         help="Upload a CSV with a column named 'Symbol' containing scrip names."
     )
+
+    run_batch = False
+    unique_symbols = []
 
     if uploaded_file is not None:
         try:
@@ -702,13 +917,11 @@ else:
             st.warning("⚠️ The uploaded CSV file is empty.")
             st.stop()
 
-        # Find symbol column case-insensitively
         symbol_col = next((c for c in input_df.columns if str(c).strip().lower() in ["symbol", "ticker", "scrip", "symbol_name"]), None)
         if not symbol_col:
             st.info("💡 Could not automatically find a column named 'Symbol'. Please select the column from your file:")
             symbol_col = st.selectbox("Select Symbol Column:", input_df.columns)
 
-        # Extract symbols
         raw_symbols = [str(s).strip() for s in input_df[symbol_col].dropna() if str(s).strip()]
         unique_symbols = list(dict.fromkeys(raw_symbols))
 
@@ -728,35 +941,62 @@ else:
         st.markdown(f"**Found {len(unique_symbols)} unique symbols** in `{uploaded_file.name}` (Total rows: {len(input_df)}):")
         st.dataframe(pd.DataFrame(preview_data), hide_index=True, **STRETCH)
 
-        # Start Batch Button
         st.markdown("<br>", unsafe_allow_html=True)
-        run_batch = st.button(f"🚀 Start Batch Download for {len(unique_symbols)} Symbols & Create ZIP", type="primary", **STRETCH)
+        run_batch = st.button(
+            f"🚀 Fetch Fresh Data from Yahoo, Save to Server & Run Screener ({len(unique_symbols)} Symbols)",
+            type="primary",
+            **STRETCH
+        )
 
-        if run_batch:
-            progress_bar = st.progress(0.0)
-            status_box = st.empty()
-            
-            zip_buffer = io.BytesIO()
-            results_manifest = []
-            successful_count = 0
-            failed_count = 0
-            total_records = 0
+    # Step 4: Execution Engine (Triggered by either Fresh Batch or Server Cache Test)
+    should_run = run_batch or test_server_btn
+    run_source = "fresh_fetch" if run_batch else ("server_cache" if test_server_btn else "")
 
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-                total_syms = len(unique_symbols)
-                for idx, sym in enumerate(unique_symbols):
-                    # Formulate query ticker
-                    if auto_skip_existing and (sym.endswith(".NS") or sym.endswith(".BO") or sym.startswith("^")):
-                        query_ticker = sym.upper()
-                    else:
-                        query_ticker = f"{sym.upper()}{batch_suffix}"
+    if should_run:
+        progress_bar = st.progress(0.0)
+        status_box = st.empty()
 
-                    status_box.markdown(f"⏳ **Fetching ({idx + 1}/{total_syms}):** `{query_ticker}`...")
-                    
+        all_zip_buffer = io.BytesIO()
+        filtered_zip_buffer = io.BytesIO()
+        manifest_records = []
+        filtered_records = []
+        cached_stock_dfs = {}
+
+        successful_count = 0
+        failed_count = 0
+        matched_count = 0
+        total_records = 0
+
+        # Determine symbols to process
+        if run_source == "fresh_fetch":
+            symbols_to_process = unique_symbols
+        else:
+            symbols_to_process = [
+                f.replace("_OHLC.csv", "").replace(".csv", "")
+                for f in server_saved_csvs
+            ]
+
+        total_syms = len(symbols_to_process)
+
+        with zipfile.ZipFile(all_zip_buffer, "w", zipfile.ZIP_DEFLATED) as all_zf, \
+             zipfile.ZipFile(filtered_zip_buffer, "w", zipfile.ZIP_DEFLATED) as filtered_zf:
+
+            for idx, sym in enumerate(symbols_to_process):
+                # Formulate query ticker
+                if auto_skip_existing and (sym.endswith(".NS") or sym.endswith(".BO") or sym.startswith("^")):
+                    query_ticker = sym.upper()
+                else:
+                    query_ticker = f"{sym.upper()}{batch_suffix}"
+
+                status_label = "Fetching" if run_source == "fresh_fetch" else "Reading cache"
+                status_box.markdown(f"⏳ **{status_label} ({idx + 1}/{total_syms}):** `{sym.upper()}`...")
+
+                df_sym = None
+                export_sym_df = None
+
+                if run_source == "fresh_fetch":
                     df_sym = fetch_stock_ohlc(query_ticker, start_date, end_date, auto_adjust=auto_adjust)
-
                     if df_sym is not None and not df_sym.empty:
-                        # Format decimals if requested
                         export_sym_df = df_sym.copy()
                         sym_price_cols = [c for c in ["Open", "High", "Low", "Close", "Adj Close"] if c in export_sym_df.columns]
                         if decimal_places == "2 Decimals":
@@ -765,89 +1005,268 @@ else:
                         elif decimal_places == "4 Decimals":
                             for c in sym_price_cols:
                                 export_sym_df[c] = export_sym_df[c].round(4)
+                        
+                        # Save to server disk in SAVED_DATA_DIR for testing
+                        server_csv_path = os.path.join(SAVED_DATA_DIR, f"{sym.upper()}_OHLC.csv")
+                        try:
+                            export_sym_df.to_csv(server_csv_path, index=False)
+                        except Exception:
+                            pass
+                else:
+                    # Load directly from server disk
+                    server_csv_path = os.path.join(SAVED_DATA_DIR, f"{sym.upper()}_OHLC.csv")
+                    if not os.path.exists(server_csv_path):
+                        server_csv_path = os.path.join(SAVED_DATA_DIR, f"{sym.upper()}.csv")
+                    if os.path.exists(server_csv_path):
+                        try:
+                            export_sym_df = pd.read_csv(server_csv_path)
+                            df_sym = export_sym_df
+                        except Exception:
+                            df_sym = None
 
-                        csv_data = export_sym_df.to_csv(index=False)
-                        filename = f"{sym.upper()}_OHLC_{start_date}_to_{end_date}.csv"
-                        zf.writestr(filename, csv_data)
+                if df_sym is not None and not df_sym.empty and "Close" in export_sym_df.columns:
+                    csv_str = export_sym_df.to_csv(index=False)
+                    filename = f"{sym.upper()}_OHLC.csv"
+                    all_zf.writestr(filename, csv_str)
+                    
+                    # Cache in memory for instant chart inspection
+                    cached_stock_dfs[sym.upper()] = export_sym_df
 
-                        latest_close = export_sym_df["Close"].iloc[-1] if "Close" in export_sym_df.columns else 0.0
-                        results_manifest.append({
-                            "Scrip Symbol": sym,
-                            "Query Ticker": query_ticker,
-                            "Status": "✅ Success",
-                            "Trading Days": len(export_sym_df),
-                            "Latest Close": f"{latest_close:,.2f}",
-                            "File Name": filename
-                        })
-                        successful_count += 1
-                        total_records += len(export_sym_df)
+                    # Calculate Moving Average
+                    ma_series = compute_moving_average(export_sym_df, ma_period, ma_type_short)
+                    trading_days = len(export_sym_df)
+                    latest_close = float(export_sym_df["Close"].iloc[-1])
+                    latest_ma = float(ma_series.iloc[-1]) if not ma_series.empty and not pd.isna(ma_series.iloc[-1]) else float('nan')
+                    latest_date = str(export_sym_df["Date"].iloc[-1]) if "Date" in export_sym_df.columns else "N/A"
+
+                    # Evaluate Screener Condition
+                    if trading_days < ma_period or pd.isna(latest_ma):
+                        is_match = False
+                        diff_pct, diff_pts = 0.0, 0.0
+                        eval_status = f"⚠️ Insufficient data ({trading_days} < {ma_period} candles)"
                     else:
-                        results_manifest.append({
-                            "Scrip Symbol": sym,
+                        is_match, diff_pct, diff_pts, eval_status = evaluate_screener_condition(
+                            latest_close, latest_ma, comparison_mode, operator_choice, target_ma_val, tolerance_pct
+                        )
+
+                    if is_match:
+                        matched_count += 1
+                        filtered_zf.writestr(filename, csv_str)
+                        filtered_records.append({
+                            "Symbol": sym.upper(),
                             "Query Ticker": query_ticker,
-                            "Status": "❌ No Data / Error",
-                            "Trading Days": 0,
-                            "Latest Close": "-",
-                            "File Name": "-"
+                            "Latest Date": latest_date,
+                            "Close Price": round(latest_close, 2),
+                            f"{ma_type_short}({ma_period})": round(latest_ma, 2),
+                            "Distance (%)": f"{diff_pct:+.2f}%",
+                            "Distance (Pts)": f"{diff_pts:+.2f}",
+                            "Status": "✅ Pass"
                         })
-                        failed_count += 1
 
-                    progress_bar.progress((idx + 1) / total_syms)
+                    manifest_records.append({
+                        "Symbol": sym.upper(),
+                        "Query Ticker": query_ticker,
+                        "Status": "✅ Pass" if is_match else ("❌ Fail" if eval_status == "Failed" else eval_status),
+                        "Latest Close": f"{latest_close:,.2f}",
+                        f"{ma_type_short}({ma_period})": f"{latest_ma:,.2f}" if not pd.isna(latest_ma) else "N/A",
+                        "Distance (%)": f"{diff_pct:+.2f}%" if not pd.isna(latest_ma) else "-",
+                        "Trading Days": trading_days,
+                        "Condition Met": "YES" if is_match else "NO"
+                    })
+                    successful_count += 1
+                    total_records += len(export_sym_df)
+                else:
+                    manifest_records.append({
+                        "Symbol": sym.upper(),
+                        "Query Ticker": query_ticker,
+                        "Status": "❌ Error / No Data",
+                        "Latest Close": "-",
+                        f"{ma_type_short}({ma_period})": "-",
+                        "Distance (%)": "-",
+                        "Trading Days": 0,
+                        "Condition Met": "NO"
+                    })
+                    failed_count += 1
 
-                # Write batch summary manifest into the zip
-                manifest_df = pd.DataFrame(results_manifest)
-                zf.writestr("_BATCH_DOWNLOAD_SUMMARY.csv", manifest_df.to_csv(index=False))
+                progress_bar.progress((idx + 1) / total_syms)
 
-            status_box.success(f"🎉 Batch processing complete! {successful_count} of {total_syms} symbols fetched successfully.")
-            
-            # Store in session state so download button persists without re-fetching
-            st.session_state["batch_zip_data"] = zip_buffer.getvalue()
-            st.session_state["batch_manifest"] = results_manifest
-            st.session_state["batch_meta"] = {
-                "total": total_syms,
-                "success": successful_count,
-                "failed": failed_count,
-                "total_records": total_records,
-                "start_date": str(start_date),
-                "end_date": str(end_date),
-                "zip_filename": f"equity_ohlc_batch_{start_date}_to_{end_date}.zip"
-            }
+            # Write manifest CSVs into ZIP archives
+            manifest_df = pd.DataFrame(manifest_records)
+            all_zf.writestr("_ALL_STOCKS_MANIFEST.csv", manifest_df.to_csv(index=False))
 
-        # If batch results exist in session_state, display summary & download button
-        if "batch_zip_data" in st.session_state and st.session_state["batch_zip_data"]:
-            batch_meta = st.session_state["batch_meta"]
-            zip_size_kb = len(st.session_state["batch_zip_data"]) / 1024
+            if filtered_records:
+                filtered_df = pd.DataFrame(filtered_records)
+                filtered_zf.writestr("_FILTERED_STOCKS_SUMMARY.csv", filtered_df.to_csv(index=False))
 
-            st.markdown("---")
-            st.subheader("📊 Batch Summary & Download")
+        status_box.success(
+            f"🎉 Screener complete! Processed {total_syms} stocks. "
+            f"**{matched_count} stocks matched** the Moving Average condition."
+        )
 
-            # Metrics
-            bm1, bm2, bm3, bm4, bm5 = st.columns(5)
-            with bm1:
-                st.metric("Total Symbols", f"{batch_meta['total']}")
-            with bm2:
-                st.metric("Successful", f"{batch_meta['success']}")
-            with bm3:
-                st.metric("Failed / Empty", f"{batch_meta['failed']}")
-            with bm4:
-                st.metric("Total Rows", f"{batch_meta['total_records']:,}")
-            with bm5:
-                st.metric("ZIP Size", f"{zip_size_kb:.1f} KB")
+        # Store in session_state for persistence across reruns
+        st.session_state["screener_matched"] = filtered_records
+        st.session_state["screener_all"] = manifest_records
+        st.session_state["cached_stock_dfs"] = cached_stock_dfs
+        st.session_state["batch_zip_data"] = all_zip_buffer.getvalue()
+        st.session_state["filtered_zip_data"] = filtered_zip_buffer.getvalue() if filtered_records else None
+        st.session_state["screener_meta"] = {
+            "total": total_syms,
+            "success": successful_count,
+            "failed": failed_count,
+            "matched": matched_count,
+            "total_records": total_records,
+            "rule_text": rule_text,
+            "ma_type": ma_type_short,
+            "ma_period": ma_period,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "all_zip_filename": f"equity_batch_all_{start_date}_to_{end_date}.zip",
+            "filtered_zip_filename": f"filtered_stocks_{ma_type_short}{ma_period}_{start_date}_to_{end_date}.zip"
+        }
 
-            st.markdown("<br>", unsafe_allow_html=True)
-            
-            # Prominent Download Button
-            st.download_button(
-                label=f"📥 Download All {batch_meta['success']} CSVs in ZIP Archive ({zip_size_kb:.1f} KB)",
-                data=st.session_state["batch_zip_data"],
-                file_name=batch_meta["zip_filename"],
-                mime="application/zip",
-                type="primary",
-                **STRETCH
-            )
+    # Step 5: Results Display (Metrics, Filtered Stocks, Inspector & Downloads)
+    if "screener_meta" in st.session_state and st.session_state["screener_meta"]:
+        sm = st.session_state["screener_meta"]
+        matched_records = st.session_state.get("screener_matched", [])
+        all_records = st.session_state.get("screener_all", [])
+        cached_dfs = st.session_state.get("cached_stock_dfs", {})
 
-            # Results Manifest Table
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.subheader("📋 Processing Manifest")
-            manifest_display_df = pd.DataFrame(st.session_state["batch_manifest"])
-            st.dataframe(manifest_display_df, hide_index=True, **STRETCH)
+        st.markdown("---")
+        st.subheader("📊 Screener Results & Analysis")
+        st.markdown(f'<div class="rule-banner">📌 <b>Evaluated Rule:</b> {sm["rule_text"]}</div>', unsafe_allow_html=True)
+
+        # Metrics cards
+        pass_rate = (sm["matched"] / sm["total"] * 100.0) if sm["total"] > 0 else 0.0
+        sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+        with sm1:
+            st.metric("Total Analyzed", f"{sm['total']}")
+        with sm2:
+            st.metric("Matched Condition", f"{sm['matched']}")
+        with sm3:
+            st.metric("Failed Condition", f"{sm['total'] - sm['matched']}")
+        with sm4:
+            st.metric("Pass Rate", f"{pass_rate:.1f}%")
+        with sm5:
+            zip_kb = len(st.session_state["batch_zip_data"]) / 1024 if st.session_state.get("batch_zip_data") else 0
+            st.metric("All CSVs ZIP", f"{zip_kb:.1f} KB")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        tab_filtered, tab_all = st.tabs([
+            f"🎯 Filtered Stocks ({len(matched_records)})",
+            f"📋 All Processed Scrips ({len(all_records)})"
+        ])
+
+        with tab_filtered:
+            if matched_records:
+                filtered_display_df = pd.DataFrame(matched_records)
+                st.dataframe(filtered_display_df, hide_index=True, **STRETCH)
+
+                st.markdown("<br>", unsafe_allow_html=True)
+                dl_col1, dl_col2 = st.columns(2)
+                with dl_col1:
+                    # CSV Download of filtered stocks list
+                    filtered_csv_bytes = filtered_display_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label=f"📄 Download Filtered Stocks List ({len(matched_records)} stocks CSV)",
+                        data=filtered_csv_bytes,
+                        file_name=f"filtered_stocks_{sm['ma_type']}_{sm['ma_period']}.csv",
+                        mime="text/csv",
+                        type="primary",
+                        **STRETCH
+                    )
+                with dl_col2:
+                    if st.session_state.get("filtered_zip_data"):
+                        st.download_button(
+                            label="📦 Download Filtered Stocks OHLC Data (.ZIP)",
+                            data=st.session_state["filtered_zip_data"],
+                            file_name=sm["filtered_zip_filename"],
+                            mime="application/zip",
+                            **STRETCH
+                        )
+
+                # Interactive Candlestick + MA Inspector for any filtered stock
+                st.markdown("<br>", unsafe_allow_html=True)
+                with st.expander("🔎 Interactive Chart Inspector for Filtered Stocks", expanded=True):
+                    matched_syms = [r["Symbol"] for r in matched_records]
+                    selected_stock = st.selectbox("Select a filtered stock to inspect chart:", matched_syms)
+
+                    if selected_stock and selected_stock in cached_dfs:
+                        sdf = cached_dfs[selected_stock].copy()
+                        sma_line = compute_moving_average(sdf, sm["ma_period"], sm["ma_type"])
+                        
+                        fig = make_subplots(
+                            rows=2, cols=1,
+                            shared_xaxes=True,
+                            vertical_spacing=0.04,
+                            subplot_titles=(f"{selected_stock} with {sm['ma_type']}({sm['ma_period']}) Overlay", "Trading Volume"),
+                            row_heights=[0.75, 0.25]
+                        )
+
+                        # Candlestick
+                        fig.add_trace(
+                            go.Candlestick(
+                                x=sdf["Date"],
+                                open=sdf["Open"],
+                                high=sdf["High"],
+                                low=sdf["Low"],
+                                close=sdf["Close"],
+                                name="OHLC",
+                                increasing_line_color="#10B981",
+                                decreasing_line_color="#EF4444"
+                            ),
+                            row=1, col=1
+                        )
+
+                        # Moving Average Overlay Line
+                        fig.add_trace(
+                            go.Scatter(
+                                x=sdf["Date"],
+                                y=sma_line,
+                                mode="lines",
+                                name=f"{sm['ma_type']}({sm['ma_period']})",
+                                line=dict(color="#F59E0B", width=2.5)
+                            ),
+                            row=1, col=1
+                        )
+
+                        # Volume
+                        if "Volume" in sdf.columns:
+                            colors = ["#10B981" if c >= o else "#EF4444" for c, o in zip(sdf["Close"], sdf["Open"])]
+                            fig.add_trace(
+                                go.Bar(
+                                    x=sdf["Date"],
+                                    y=sdf["Volume"],
+                                    name="Volume",
+                                    marker_color=colors,
+                                    opacity=0.6
+                                ),
+                                row=2, col=1
+                            )
+
+                        fig.update_layout(
+                            xaxis_rangeslider_visible=False,
+                            height=520,
+                            margin=dict(l=20, r=20, t=40, b=20),
+                            template="plotly_white",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                        )
+                        st.plotly_chart(fig, **STRETCH)
+            else:
+                st.warning(f"⚠️ No stocks met the condition: **{sm['rule_text']}**.")
+                st.info("💡 Try adjusting the MA period, changing the operator (> / < / ≈), or increasing the tolerance band.")
+
+        with tab_all:
+            all_display_df = pd.DataFrame(all_records)
+            st.dataframe(all_display_df, hide_index=True, **STRETCH)
+
+            if st.session_state.get("batch_zip_data"):
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.download_button(
+                    label=f"📥 Download All {sm['success']} Stock CSVs in ZIP Archive",
+                    data=st.session_state["batch_zip_data"],
+                    file_name=sm["all_zip_filename"],
+                    mime="application/zip",
+                    type="primary",
+                    **STRETCH
+                )
